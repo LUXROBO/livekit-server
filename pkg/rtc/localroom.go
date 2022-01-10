@@ -1,42 +1,49 @@
 package rtc
 
 import (
+	"math"
+	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/livekit/livekit-server/pkg/config"
+	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
+	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 )
 
 const (
-	DefaultEmptyTimeout       = 5 * 60 // 5m
-	DefaultRoomDepartureGrace = 20
-	// RAJA-REMOVE AudioLevelQuantization    = 8 // ideally power of 2 to minimize float decimal
+	/* RAJA-TODO
+	   DefaultEmptyTimeout       = 5 * 60 // 5m
+	   DefaultRoomDepartureGrace = 20
+	   RAJA-TODO */
+	AudioLevelQuantization = 8 // ideally power of 2 to minimize float decimal
 )
 
-type Room struct {
-	/* RAJA-TODO
+type LocalRoom struct {
 	lock sync.RWMutex
 
 	Room   *livekit.Room
 	Logger logger.Logger
 
-	config      WebRTCConfig
+	// RAJA-TODO config      WebRTCConfig
 	audioConfig *config.AudioConfig
 	telemetry   telemetry.TelemetryService
 
-	// map of identity -> Participant
+	// map of identity -> types.Participant
 	participants    map[livekit.ParticipantIdentity]types.Participant
 	participantOpts map[livekit.ParticipantIdentity]*ParticipantOptions
-	bufferFactory   *buffer.Factory
-	RAJA-REMOVE */
-	*LocalRoom
 
+	bufferFactory *buffer.Factory
+
+	/* RAJA-TODO
 	// time the first participant joined the room
 	joinedAt atomic.Value
 	// time that the last participant left the room
@@ -47,35 +54,33 @@ type Room struct {
 	onParticipantChanged func(p types.Participant)
 	onMetadataUpdate     func(metadata string)
 	onClose              func()
+	RAJA-TODO */
 }
 
-/* RAJA-REMOVE
 type ParticipantOptions struct {
 	AutoSubscribe bool
+	SyncState     *livekit.SyncState
+	MigrateIn     bool
+	MigrateOut    bool
 }
-RAJA-REMOVE */
 
-func NewRoom(room *livekit.Room, config WebRTCConfig, audioConfig *config.AudioConfig, telemetry telemetry.TelemetryService) *Room {
-	r := &Room{
-		// RAJA-REMOVE Room:   proto.Clone(room).(*livekit.Room),
-		// RAJA-REMOVE Logger: LoggerWithRoom(logger.Logger(logger.GetLogger()), livekit.RoomName(room.Name)),
-		// RAJA-REMOVE config:          config,
-		// RAJA-REMOVE audioConfig:     audioConfig,
-		// RAJA-REMOVE telemetry:       telemetry,
-		// RAJA-REMOVE participants:    make(map[livekit.ParticipantIdentity]types.Participant),
-		// RAJA-REMOVE participantOpts: make(map[livekit.ParticipantIdentity]*ParticipantOptions),
-		// RAJA-REMOVE bufferFactory:   buffer.NewBufferFactory(config.Receiver.PacketBufferSize, logr.Logger{}),
-		closed: make(chan struct{}),
+func NewLocalRoom(
+	room *livekit.Room,
+	config WebRTCConfig,
+	audioConfig *config.AudioConfig,
+	telemetry telemetry.TelemetryService,
+	logger logger.Logger,
+) *LocalRoom {
+	r := &LocalRoom{
+		Room:            proto.Clone(room).(*livekit.Room),
+		Logger:          logger,
+		audioConfig:     audioConfig,
+		telemetry:       telemetry,
+		participants:    make(map[livekit.ParticipantIdentity]types.Participant),
+		participantOpts: make(map[livekit.ParticipantIdentity]*ParticipantOptions),
+		bufferFactory:   buffer.NewBufferFactory(config.Receiver.PacketBufferSize, logr.Logger{}),
+		// RAJA-TODO closed:          make(chan struct{}),
 	}
-
-	r.LocalRoom = NewLocalRoom(
-		room,
-		config,
-		audioConfig,
-		telemetry,
-		LoggerWithRoom(logger.Logger(logger.GetLogger()), livekit.RoomName(room.Name)),
-	)
-
 	/* RAJA-TODO
 	if r.Room.EmptyTimeout == 0 {
 		r.Room.EmptyTimeout = DefaultEmptyTimeout
@@ -91,18 +96,14 @@ func NewRoom(room *livekit.Room, config WebRTCConfig, audioConfig *config.AudioC
 	return r
 }
 
-func (r *Room) Name() livekit.RoomName {
-	return livekit.RoomName(r.Room.Name)
-}
-
-/* RAJA-REMOVE
-func (r *Room) GetParticipant(identity livekit.ParticipantIdentity) types.Participant {
+func (r *LocalRoom) GetParticipant(identity livekit.ParticipantIdentity) types.Participant {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
+
 	return r.participants[identity]
 }
 
-func (r *Room) GetParticipantBySid(participantID livekit.ParticipantID) types.Participant {
+func (r *LocalRoom) GetParticipantByID(participantID livekit.ParticipantID) types.Participant {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 
@@ -115,7 +116,7 @@ func (r *Room) GetParticipantBySid(participantID livekit.ParticipantID) types.Pa
 	return nil
 }
 
-func (r *Room) GetParticipants() []types.Participant {
+func (r *LocalRoom) GetParticipants() []types.Participant {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 	participants := make([]types.Participant, 0, len(r.participants))
@@ -125,7 +126,7 @@ func (r *Room) GetParticipants() []types.Participant {
 	return participants
 }
 
-func (r *Room) GetActiveSpeakers() []*livekit.SpeakerInfo {
+func (r *LocalRoom) GetActiveSpeakers() []*livekit.SpeakerInfo {
 	participants := r.GetParticipants()
 	speakers := make([]*livekit.SpeakerInfo, 0, len(participants))
 	for _, p := range participants {
@@ -146,12 +147,12 @@ func (r *Room) GetActiveSpeakers() []*livekit.SpeakerInfo {
 	return speakers
 }
 
-func (r *Room) GetBufferFactory() *buffer.Factory {
+func (r *LocalRoom) GetBufferFactory() *buffer.Factory {
 	return r.bufferFactory
 }
-RAJA-REMOVE */
 
-func (r *Room) FirstJoinedAt() int64 {
+/* RAJA-TODO
+func (r *LocalRoom) FirstJoinedAt() int64 {
 	j := r.joinedAt.Load()
 	if t, ok := j.(int64); ok {
 		return t
@@ -166,9 +167,9 @@ func (r *Room) LastLeftAt() int64 {
 	}
 	return 0
 }
+RAJA-TODO */
 
-/* RAJA-REMOVE
-func (r *Room) Join(participant types.Participant, opts *ParticipantOptions, iceServers []*livekit.ICEServer) error {
+func (r *LocalRoom) Join(participant types.Participant, opts *ParticipantOptions, iceServers []*livekit.ICEServer) error {
 	if r.IsClosed() {
 		prometheus.ServiceOperationCounter.WithLabelValues("participant_join", "error", "room_closed").Add(1)
 		return ErrRoomClosed
@@ -182,17 +183,24 @@ func (r *Room) Join(participant types.Participant, opts *ParticipantOptions, ice
 		return ErrAlreadyJoined
 	}
 
+	// RAJA-TODO: this needs a callback to check if participant limit is exceeded
+	/* RAJA-TODO
 	if r.Room.MaxParticipants > 0 && int(r.Room.MaxParticipants) == len(r.participants) {
 		prometheus.ServiceOperationCounter.WithLabelValues("participant_join", "error", "max_exceeded").Add(1)
 		return ErrMaxParticipantsExceeded
 	}
+	RAJA-TODO */
 
+	/* RAJA-TODO: This needs to be a callback
 	if r.FirstJoinedAt() == 0 {
 		r.joinedAt.Store(time.Now().Unix())
 	}
+	RAJA-TODO */
+	/* RAJA-TODO
 	if !participant.Hidden() {
 		r.Room.NumParticipants++
 	}
+	RAJA-TODO */
 
 	// it's important to set this before connection, we don't want to miss out on any publishedTracks
 	participant.OnTrackPublished(r.onTrackPublished)
@@ -220,6 +228,7 @@ func (r *Room) Join(participant types.Participant, opts *ParticipantOptions, ice
 			go r.RemoveParticipant(p.Identity())
 		}
 	})
+	// RAJA-TODO: all these need context, Join should take a context argument
 	participant.OnTrackUpdated(r.onTrackUpdated)
 	participant.OnMetadataUpdate(r.onParticipantMetadataUpdate)
 	participant.OnDataPacket(r.onDataPacket)
@@ -274,7 +283,19 @@ func (r *Room) Join(participant types.Participant, opts *ParticipantOptions, ice
 	return nil
 }
 
-func (r *Room) ResumeParticipant(p types.Participant, responseSink routing.MessageSink) error {
+func (r *LocalRoom) verifyParticipant(p types.Participant) {
+	/* RAJA-TODO
+	ctx, span := tracer.Start(ctx, "room.verifyParticipant", trace.WithNewRoot())
+	defer span.End()
+	RAJA-TODO */
+
+	state := p.State()
+	if state == livekit.ParticipantInfo_JOINING || state == livekit.ParticipantInfo_JOINED {
+		r.RemoveParticipant(p.Identity())
+	}
+}
+
+func (r *LocalRoom) ResumeParticipant(p types.Participant, responseSink routing.MessageSink) error {
 	// close previous sink, and link to new one
 	if prevSink := p.GetResponseSink(); prevSink != nil {
 		prevSink.Close()
@@ -292,7 +313,7 @@ func (r *Room) ResumeParticipant(p types.Participant, responseSink routing.Messa
 	return nil
 }
 
-func (r *Room) RemoveParticipant(identity livekit.ParticipantIdentity) {
+func (r *LocalRoom) RemoveParticipant(identity livekit.ParticipantIdentity) {
 	r.lock.Lock()
 	p, ok := r.participants[identity]
 	if ok {
@@ -325,6 +346,7 @@ func (r *Room) RemoveParticipant(identity livekit.ParticipantIdentity) {
 
 	// send broadcast only if it's not already closed
 	sendUpdates := p.State() != livekit.ParticipantInfo_DISCONNECTED
+	// RAJA-TODO !r.LocalParticipantMigrateOut(p)
 
 	p.OnTrackUpdated(nil)
 	p.OnTrackPublished(nil)
@@ -347,16 +369,21 @@ func (r *Room) RemoveParticipant(identity livekit.ParticipantIdentity) {
 		}
 		r.broadcastParticipantState(p, true)
 	}
+
+	// RAJA-TODO: visible participants check
 }
 
-func (r *Room) UpdateSubscriptions(
+func (r *LocalRoom) UpdateSubscriptions(
 	participant types.Participant,
 	trackIDs []livekit.TrackID,
 	participantTracks []*livekit.ParticipantTracks,
 	subscribe bool,
 ) error {
+	// RAJA-TODO check canSubscribe
+
 	// find all matching tracks
 	trackPublishers := make(map[livekit.TrackID]types.Participant)
+	// RAJA-TODO getAllParticipants
 	participants := r.GetParticipants()
 	for _, trackID := range trackIDs {
 		for _, p := range participants {
@@ -369,7 +396,7 @@ func (r *Room) UpdateSubscriptions(
 	}
 
 	for _, pt := range participantTracks {
-		p := r.GetParticipantBySid(livekit.ParticipantID(pt.ParticipantSid))
+		p := r.GetParticipantByID(livekit.ParticipantID(pt.ParticipantSid))
 		if p == nil {
 			continue
 		}
@@ -388,22 +415,24 @@ func (r *Room) UpdateSubscriptions(
 			publisher.RemoveSubscriber(participant, trackID)
 		}
 	}
-	return nil
-}
-RAJA-REMOVE */
 
-func (r *Room) SyncState(participant types.Participant, state *livekit.SyncState) error {
 	return nil
 }
 
 /* RAJA-REMOVE
-func (r *Room) UpdateSubscriptionPermissions(participant types.Participant, permissions *livekit.UpdateSubscriptionPermissions) error {
-	return participant.UpdateSubscriptionPermissions(permissions, r.GetParticipantBySid)
+func (r *Room) SyncState(participant types.Participant, state *livekit.SyncState) error {
+	return nil
+}
+*/
+
+func (r *LocalRoom) UpdateSubscriptionPermissions(participant types.Participant, permissions *livekit.UpdateSubscriptionPermissions) error {
+	return participant.UpdateSubscriptionPermissions(permissions, r.GetParticipantByID)
 }
 
-func (r *Room) RemoveDisallowedSubscriptions(sub types.Participant, disallowedSubscriptions map[livekit.TrackID]livekit.ParticipantID) {
+func (r *LocalRoom) RemoveDisallowedSubscriptions(sub types.Participant, disallowedSubscriptions map[livekit.TrackID]livekit.ParticipantID) {
+	// RAJA-TODO: cloud has to call this and also through remote participants
 	for trackID, publisherID := range disallowedSubscriptions {
-		pub := r.GetParticipantBySid(publisherID)
+		pub := r.GetParticipantByID(publisherID)
 		if pub == nil {
 			continue
 		}
@@ -412,12 +441,12 @@ func (r *Room) RemoveDisallowedSubscriptions(sub types.Participant, disallowedSu
 	}
 }
 
-func (r *Room) UpdateVideoLayers(participant types.Participant, updateVideoLayers *livekit.UpdateVideoLayers) error {
+func (r *LocalRoom) UpdateVideoLayers(participant types.Participant, updateVideoLayers *livekit.UpdateVideoLayers) error {
 	return participant.UpdateVideoLayers(updateVideoLayers)
 }
-RAJA-REMOVE */
 
-func (r *Room) IsClosed() bool {
+/* RAJA_TODO: can potentially re-used
+func (r *LocalRoom) IsClosed() bool {
 	select {
 	case <-r.closed:
 		return true
@@ -425,7 +454,9 @@ func (r *Room) IsClosed() bool {
 		return false
 	}
 }
+*/
 
+/* RAJA-TODO
 // CloseIfEmpty closes the room if all participants had left, or it's still empty past timeout
 func (r *Room) CloseIfEmpty() {
 	if r.IsClosed() {
@@ -461,8 +492,10 @@ func (r *Room) CloseIfEmpty() {
 		r.Close()
 	}
 }
+*/
 
-func (r *Room) Close() {
+func (r *LocalRoom) Close() {
+	// RAJA-TODO: close all participants, cloud has to close remote participants also
 	r.closeOnce.Do(func() {
 		close(r.closed)
 		r.Logger.Infow("closing room", "roomID", r.Room.Sid, "room", r.Room.Name)
@@ -476,11 +509,11 @@ func (r *Room) OnClose(f func()) {
 	r.onClose = f
 }
 
-func (r *Room) OnParticipantChanged(f func(participant types.Participant)) {
+func (r *LocalRoom) OnParticipantChanged(f func(participant types.Participant)) {
 	r.onParticipantChanged = f
 }
 
-func (r *Room) SendDataPacket(up *livekit.UserPacket, kind livekit.DataPacket_Kind) {
+func (r *LocalRoom) SendDataPacket(up *livekit.UserPacket, kind livekit.DataPacket_Kind) {
 	dp := &livekit.DataPacket{
 		Kind: kind,
 		Value: &livekit.DataPacket_User{
@@ -490,7 +523,7 @@ func (r *Room) SendDataPacket(up *livekit.UserPacket, kind livekit.DataPacket_Ki
 	r.onDataPacket(nil, dp)
 }
 
-func (r *Room) SetMetadata(metadata string) {
+func (r *LocalRoom) SetMetadata(metadata string) {
 	r.Room.Metadata = metadata
 
 	r.lock.RLock()
@@ -502,7 +535,7 @@ func (r *Room) SetMetadata(metadata string) {
 	}
 }
 
-func (r *Room) sendRoomUpdateLocked() {
+func (r *LocalRoom) sendRoomUpdateLocked() {
 	// Send update to participants
 	for _, p := range r.participants {
 		if !p.IsReady() {
@@ -516,12 +549,12 @@ func (r *Room) sendRoomUpdateLocked() {
 	}
 }
 
-func (r *Room) OnMetadataUpdate(f func(metadata string)) {
+func (r *LocalRoom) OnMetadataUpdate(f func(metadata string)) {
 	r.onMetadataUpdate = f
 }
 
 // checks if participant should be autosubscribed to new tracks, assumes lock is already acquired
-func (r *Room) autoSubscribe(participant types.Participant) bool {
+func (r *LocalRoom) autoSubscribe(participant types.Participant) bool {
 	if !participant.CanSubscribe() {
 		return false
 	}
@@ -534,12 +567,13 @@ func (r *Room) autoSubscribe(participant types.Participant) bool {
 	return true
 }
 
-/* RAJA-REMOVE
 // a ParticipantImpl in the room added a new remoteTrack, subscribe other participants to it
-func (r *Room) onTrackPublished(participant types.Participant, track types.PublishedTrack) {
+func (r *LocalRoom) onTrackPublished(participant types.Participant, track types.PublishedTrack) {
 	// publish participant update, since track state is changed
+	// RAJA-TODO: this is done only if migrate state is MigrateStateComplete in cloud
 	r.broadcastParticipantState(participant, true)
 
+	// RAJA-TODO: cloud need to handle remote participants too
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 
@@ -553,6 +587,7 @@ func (r *Room) onTrackPublished(participant types.Participant, track types.Publi
 			// not fully joined. don't subscribe yet
 			continue
 		}
+		// RAJA-TODO: there is a resume check in cloud code
 		if !r.autoSubscribe(existingParticipant) {
 			continue
 		}
@@ -568,28 +603,32 @@ func (r *Room) onTrackPublished(participant types.Participant, track types.Publi
 				"track", track.ID())
 		}
 	}
+	// RAJA-TODO - cloud cleans up RemovePublishedTrack and participants if there are no published tracks
 
 	if r.onParticipantChanged != nil {
 		r.onParticipantChanged(participant)
 	}
 }
 
-func (r *Room) onTrackUpdated(p types.Participant, _ types.PublishedTrack) {
+func (r *LocalRoom) onTrackUpdated(p types.Participant, _ types.PublishedTrack) {
 	// send track updates to everyone, especially if track was updated by admin
+	// RAJA-TODO: cloud checks for shoudlBroadcastUpdate
+	r.broadcastParticipantState(p, false)
+	if r.onParticipantChanged != nil {
+		r.onParticipantChanged(p)
+	}
+	// RAJA-TODO cloud has to send to remote
+}
+
+func (r *LocalRoom) onParticipantMetadataUpdate(p types.Participant) {
+	// RAJA-TODO: cloud does p.ToProto() as the first argument
 	r.broadcastParticipantState(p, false)
 	if r.onParticipantChanged != nil {
 		r.onParticipantChanged(p)
 	}
 }
 
-func (r *Room) onParticipantMetadataUpdate(p types.Participant) {
-	r.broadcastParticipantState(p, false)
-	if r.onParticipantChanged != nil {
-		r.onParticipantChanged(p)
-	}
-}
-
-func (r *Room) onDataPacket(source types.Participant, dp *livekit.DataPacket) {
+func (r *LocalRoom) onDataPacket(source types.Participant, dp *livekit.DataPacket) {
 	// don't forward if source isn't allowed to publish data
 	if source != nil && !source.CanPublishData() {
 		return
@@ -619,7 +658,8 @@ func (r *Room) onDataPacket(source types.Participant, dp *livekit.DataPacket) {
 	}
 }
 
-func (r *Room) subscribeToExistingTracks(p types.Participant) {
+func (r *LocalRoom) subscribeToExistingTracks(p types.Participant) {
+	// RAJA-TODO can subscribe check
 	r.lock.RLock()
 	shouldSubscribe := r.autoSubscribe(p)
 	r.lock.RUnlock()
@@ -628,6 +668,7 @@ func (r *Room) subscribeToExistingTracks(p types.Participant) {
 	}
 
 	tracksAdded := 0
+	// RAJA-TODO: getAllParticipants in the cloud
 	for _, op := range r.GetParticipants() {
 		if p.ID() == op.ID() {
 			// don't send to itself
@@ -650,7 +691,7 @@ func (r *Room) subscribeToExistingTracks(p types.Participant) {
 }
 
 // broadcast an update about participant p
-func (r *Room) broadcastParticipantState(p types.Participant, skipSource bool) {
+func (r *LocalRoom) broadcastParticipantState(p types.Participant, skipSource bool) {
 	//
 	// This is a critical section to ensure that participant update time and
 	// the corresponding data are paired properly.
@@ -660,6 +701,7 @@ func (r *Room) broadcastParticipantState(p types.Participant, skipSource bool) {
 	updates := ToProtoParticipants([]types.Participant{p})
 	r.lock.Unlock()
 
+	// RAJA-TODO cloud is checking pi.Hidden and doing some looping
 	if p.Hidden() {
 		if !skipSource {
 			// send update only to hidden participant
@@ -688,7 +730,7 @@ func (r *Room) broadcastParticipantState(p types.Participant, skipSource bool) {
 }
 
 // for protocol 2, send all active speakers
-func (r *Room) sendActiveSpeakers(speakers []*livekit.SpeakerInfo) {
+func (r *LocalRoom) sendActiveSpeakers(speakers []*livekit.SpeakerInfo) {
 	dp := &livekit.DataPacket{
 		Kind: livekit.DataPacket_LOSSY,
 		Value: &livekit.DataPacket_Speaker{
@@ -706,15 +748,20 @@ func (r *Room) sendActiveSpeakers(speakers []*livekit.SpeakerInfo) {
 }
 
 // for protocol 3, send only changed updates
-func (r *Room) sendSpeakerChanges(speakers []*livekit.SpeakerInfo) {
+func (r *LocalRoom) sendSpeakerChanges(changedSpeakers []*livekit.SpeakerInfo) {
+	if len(changedSpeakers) == 0 {
+		return
+	}
+
 	for _, p := range r.GetParticipants() {
+		// only protocol 3 or higher supported, send only changed updates
 		if p.ProtocolVersion().SupportsSpeakerChanged() {
-			_ = p.SendSpeakerUpdate(speakers)
+			_ = p.SendSpeakerUpdate(changeSpeakers)
 		}
 	}
 }
 
-func (r *Room) audioUpdateWorker() {
+func (r *LocalRoom) audioUpdateWorker() {
 	var smoothValues map[livekit.ParticipantID]float32
 	var smoothFactor float32
 	var activeThreshold float32
@@ -800,7 +847,7 @@ func (r *Room) audioUpdateWorker() {
 	}
 }
 
-func (r *Room) connectionQualityWorker() {
+func (r *LocalRoom) connectionQualityWorker() {
 	// send updates to only users that are subscribed to each other
 	for {
 		if r.IsClosed() {
@@ -808,6 +855,7 @@ func (r *Room) connectionQualityWorker() {
 		}
 
 		participants := r.GetParticipants()
+		// RAJA-TODO: cloud has to send remote updates
 		connectionInfos := make(map[livekit.ParticipantID]*livekit.ConnectionQualityInfo, len(participants))
 
 		for _, p := range participants {
@@ -841,7 +889,7 @@ func (r *Room) connectionQualityWorker() {
 	}
 }
 
-func (r *Room) DebugInfo() map[string]interface{} {
+func (r *LocalRoom) DebugInfo() map[string]interface{} {
 	info := map[string]interface{}{
 		"Name":      r.Room.Name,
 		"Sid":       r.Room.Sid,
@@ -857,4 +905,3 @@ func (r *Room) DebugInfo() map[string]interface{} {
 
 	return info
 }
-RAJA-REMOVE */
